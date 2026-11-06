@@ -47,3 +47,64 @@ jobs:
               return;
             }
             core.info(`Scope passed: ${files.length} changed file(s), all within approved paths.`);
+      - name: Preserve README contents and allow appended lines
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              ...context.repo,
+              pull_number: pr.number,
+              per_page: 100,
+            });
+            if (files.some(file =>
+              (file.filename === 'README.md' || file.previous_filename === 'README.md') &&
+              (file.status === 'renamed' || file.status === 'removed'))) {
+              throw new Error('README.md must not be renamed or deleted.');
+            }
+            async function readReadme(revision) {
+              const repo = {
+                owner: revision.repo.owner.login,
+                repo: revision.repo.name,
+              };
+              const { data: commit } = await github.rest.git.getCommit({
+                ...repo,
+                commit_sha: revision.sha,
+              });
+              const { data: tree } = await github.rest.git.getTree({
+                ...repo,
+                tree_sha: commit.tree.sha,
+              });
+              const entry = tree.tree.find(item => item.path === 'README.md');
+              if (tree.truncated || !entry || entry.type !== 'blob' ||
+                  !['100644', '100755'].includes(entry.mode)) {
+                throw new Error('README.md must exist as a regular file in both commits.');
+              }
+              const { data: blob } = await github.rest.git.getBlob({
+                ...repo,
+                file_sha: entry.sha,
+              });
+              if (blob.encoding !== 'base64' || typeof blob.content !== 'string') {
+                throw new Error('Unable to read README.md bytes.');
+              }
+              const bytes = Buffer.from(blob.content, 'base64');
+              if (bytes.length !== blob.size) {
+                throw new Error('Incomplete README.md content.');
+              }
+              return { bytes, mode: entry.mode };
+            }
+            const base = await readReadme(pr.base);
+            const head = await readReadme(pr.head);
+            if (head.mode !== base.mode || head.bytes.length < base.bytes.length ||
+                !head.bytes.subarray(0, base.bytes.length).equals(base.bytes)) {
+              throw new Error('README.md must preserve every existing base-file byte.');
+            }
+            const suffix = head.bytes.subarray(base.bytes.length);
+            if (suffix.length > 0) {
+              if ((base.bytes.length > 0 && base.bytes.at(-1) !== 0x0a) ||
+                  suffix.at(-1) !== 0x0a) {
+                throw new Error('README.md additions must be new lines ending in a newline.');
+              }
+              new TextDecoder('utf-8', { fatal: true }).decode(suffix);
+            }
+            core.info('README.md content protection passed.');
